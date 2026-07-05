@@ -9,11 +9,11 @@ It doesn't seek live streams at all. Instead, the Python backend fetches each br
 | Language | Bulletin source | Method |
 |---|---|---|
 | 🇩🇪 | DLF Nachrichten | RSS (verified, same as your prototype) |
-| 🇫🇷 | franceinfo Journal | per-hour journal RSS (`rss_11736` verified = Journal de 19h) |
-| 🇬🇧 | BBC WS News / NPR News Now | BBC podcast CDN RSS + NPR hourly RSS (switchable) |
+| 🇫🇷 | Radio France Journaux | 7 per-hour journal feeds (6h30, 7h30 w-e, 8h, 18h, 19h, 23h, France Culture) — newest wins |
+| 🇬🇧 | BBC WS News Bulletin | Sounds `rms` API → `playlist.json` → mediaselector mp3; RSS + NPR News Now fallbacks |
 | 🇪🇸 | RNE Boletines | RTVE open API — program id resolved at runtime |
-| 🇮🇹 | Rai GR1 | RaiPlaySound `programmi/gr1.json` API |
-| 🇧🇬 | БНР Хоризонт | server-side parse of `__NEXT_DATA__` on binar.bg / bnrnews.bg |
+| 🇮🇹 | Rai GR1 | rainews.it/notiziari/gr1 page (relinker media URL) + RaiPlaySound JSON fallback |
+| 🇧🇬 | БНР Хоризонт | `__NEXT_DATA__` + Next.js `/_next/data/` route on binar.bg / bnrnews.bg |
 
 Live fallbacks are resolved via radio-browser.info when no static URL is configured (avoids dead stream URLs and http/https mixed-content blocks).
 
@@ -25,12 +25,12 @@ Live fallbacks are resolved via radio-browser.info when no static URL is configu
 
 ## First-run checklist (Diagnostics panel)
 
-Some sources were built against documented APIs I could not fully verify from here. Expected states:
+Some sources were built against documented APIs I could not fully verify from here. Each Diagnostics entry now shows a **Trace** line: which strategy was tried, which one answered, and why others failed — paste that trace back to me if a source still misbehaves.
 
-- **DLF** — should be ✅ immediately.
-- **franceinfo** — ✅ only near/after 19h (only the Journal de 19h feed is confirmed). To get morning journals: find more `rss_XXXXX` IDs (Journal de 6h/7h/8h) — search "site:radiofrance-podcast.net journal" or use https://radio-france-rss.aerion.workers.dev — and add them to the `feeds` list of `franceinfo` in `SOURCES`. The app automatically plays the newest across all listed feeds.
-- **BBC** — if `p002vsmz.rss` is empty it silently uses the Global News Podcast; switch the English source to **NPR News Now** in the sidebar for a true hourly 5-minute bulletin.
-- **RTVE / RAI / БНР** — check Diagnostics; if ❌, the error message shows which URL failed. The fetchers are defensive (they scan the returned JSON for any audio), so partial API changes usually still work.
+- **DLF / 🇫🇷 Journaux** — should be ✅ (French now covers mornings and weekends).
+- **BBC** — tries the Sounds API for the latest 5-min bulletin episode of `p002vsmz`; falls back to Global News Podcast RSS. NPR News Now stays available as switchable hourly alternative.
+- **RAI** — scrapes the GR1 notiziari page for the newest edition's media URL. Note: RAI's relinker occasionally geo-restricts; if the bulletin won't *play* (but shows ✅), tell me — the trace will distinguish fetch vs playback problems.
+- **БНР** — parses the embedded page data and the Next.js data route; trace shows how many audio candidates were found.
 
 ## Customizing
 

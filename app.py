@@ -244,69 +244,234 @@ def fetch_rtve(slug: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-NEXT_DATA_RE = re.compile(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+NEXT_DATA_RE = re.compile(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
 BG_TITLE_RE = re.compile(r"[Ее]мисия|[Нн]овини")
+AUDIO_KEY_RE = re.compile(r"audio|sound|file|media", re.I)
 
 
-def fetch_bnr(page_urls: List[str]) -> Optional[Dict[str, Any]]:
+def _bnr_candidates_from_blob(blob: Any, base_url: str) -> List[Dict[str, Any]]:
+    candidates = []
+    for d in walk_json(blob):
+        audio = None
+        for k, v in d.items():
+            if not isinstance(v, str) or not v:
+                continue
+            am = AUDIO_RE.search(v)
+            if am:
+                audio = am.group(0)
+                break
+            # URL-ish value under an audio-hinting key (players often use CMS media routes)
+            if AUDIO_KEY_RE.search(str(k)) and (v.startswith("http") or v.startswith("/")):
+                if re.search(r"/(api|cms)/media", v, re.I) or re.search(r"\.(mp3|m4a|aac)", v, re.I):
+                    audio = urljoin(base_url, v)
+                    break
+        if not audio:
+            continue
+        title = ""
+        dt = None
+        for k, v in d.items():
+            if isinstance(v, str):
+                if not title and BG_TITLE_RE.search(v) and len(v) < 150:
+                    title = v
+                if re.search(r"date|time|created|publish", str(k), re.I):
+                    dt = dt or parse_dt_any(v)
+        candidates.append({
+            "title": title or "Емисия новини (БНР)",
+            "published": dt,
+            "audio_url": audio,
+            "_is_news": bool(title),
+        })
+    return candidates
+
+
+def fetch_bnr(page_urls: List[str], notes: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """BNR (binar.bg / bnrnews.bg): parse the Next.js __NEXT_DATA__ payload
-    server-side and dig out the newest news-bulletin audio."""
+    server-side, plus the /_next/data/ JSON route, and dig out the newest
+    news-bulletin audio."""
+    notes = notes if notes is not None else []
     for url in page_urls:
         try:
             page = http_get(url).text
-        except Exception:
+        except Exception as exc:
+            notes.append(f"page fail {url}: {str(exc)[:80]}")
             continue
-        m = NEXT_DATA_RE.search(page)
         blobs: List[Any] = []
+        build_id = None
+        m = NEXT_DATA_RE.search(page)
         if m:
             try:
-                blobs.append(json.loads(m.group(1)))
+                nd = json.loads(m.group(1))
+                blobs.append(nd)
+                build_id = nd.get("buildId")
+                notes.append(f"__NEXT_DATA__ ok (buildId={build_id})")
             except Exception:
-                pass
+                notes.append("__NEXT_DATA__ found but JSON parse failed")
+        else:
+            notes.append(f"no __NEXT_DATA__ on {url}")
+        # Richer payload via the Next.js data route
+        if build_id:
+            path, _, query = url.partition("?")
+            path = path.split("//", 1)[-1].split("/", 1)[-1] or "index"
+            data_url = urljoin(url, f"/_next/data/{build_id}/{path}.json") + (f"?{query}" if query else "")
+            try:
+                blobs.append(http_get(data_url).json())
+                notes.append("next-data route ok")
+            except Exception as exc:
+                notes.append(f"next-data route fail: {str(exc)[:80]}")
         candidates = []
         for blob in blobs:
-            for d in walk_json(blob):
-                audio = None
-                for v in d.values():
-                    if isinstance(v, str):
-                        am = AUDIO_RE.search(v)
-                        if am:
-                            audio = am.group(0)
-                            break
-                        if re.search(r"/api/media/[0-9a-f-]{20,}", v, re.I) and re.search(
-                            r"audio|sound|mp3", json.dumps(d, ensure_ascii=False), re.I
-                        ):
-                            audio = urljoin(url, v)
-                            break
-                if not audio:
-                    continue
-                title = ""
-                dt = None
-                for k, v in d.items():
-                    if isinstance(v, str):
-                        if not title and BG_TITLE_RE.search(v) and len(v) < 150:
-                            title = v
-                        if "date" in k.lower() or "time" in k.lower() or "created" in k.lower():
-                            dt = dt or parse_dt_any(v)
-                candidates.append({
-                    "title": title or "Емисия новини (БНР)",
-                    "published": dt,
-                    "audio_url": audio,
-                    "_is_news": bool(title),
-                })
-        # fallback: raw regex over whole page for mp3 near "мисия"
+            candidates.extend(_bnr_candidates_from_blob(blob, url))
         if not candidates:
             for am in AUDIO_RE.finditer(page):
-                candidates.append({
-                    "title": "Емисия новини (БНР)", "published": None,
-                    "audio_url": am.group(0), "_is_news": False,
-                })
+                candidates.append({"title": "Емисия новини (БНР)", "published": None,
+                                   "audio_url": am.group(0), "_is_news": False})
+        notes.append(f"{len(candidates)} audio candidate(s)")
         news = [c for c in candidates if c["_is_news"]] or candidates
         if news:
             dated = [c for c in news if c["published"]]
             best = max(dated, key=lambda c: c["published"]) if dated else news[0]
             best.pop("_is_news", None)
             return best
+    return None
+
+
+# ---------- BBC (brand page → episode → media) ----------
+BBC_PID_RE = re.compile(r"^[a-z0-9]{8}$")
+
+
+def _bbc_vpid(pid: str) -> Optional[str]:
+    """Episode pid → playable version pid via playlist.json."""
+    data = http_get(f"https://www.bbc.co.uk/programmes/{pid}/playlist.json").json()
+    for d in walk_json(data):
+        if isinstance(d.get("vpid"), str):
+            return d["vpid"]
+    dav = data.get("defaultAvailableVersion") or {}
+    if isinstance(dav.get("pid"), str):
+        return dav["pid"]
+    return None
+
+
+def _bbc_audio_for_vpid(vpid: str, notes: List[str]) -> Optional[str]:
+    for mediaset in ("audio-nondrm-download", "pc"):
+        try:
+            ms = http_get(
+                f"https://open.live.bbc.co.uk/mediaselector/6/select/version/2.0/"
+                f"mediaset/{mediaset}/vpid/{vpid}/format/json"
+            ).json()
+            for media in ms.get("media", []) or []:
+                for conn in media.get("connection", []) or []:
+                    href = conn.get("href", "")
+                    if href.startswith("https") and (
+                        ".mp3" in href or conn.get("transferFormat") == "plain"
+                    ):
+                        notes.append(f"mediaselector/{mediaset} ok")
+                        return href
+        except Exception as exc:
+            notes.append(f"mediaselector/{mediaset} fail: {str(exc)[:60]}")
+    # Last resort: redirect URL (browser follows the 302)
+    notes.append("using redir URL")
+    return ("https://open.live.bbc.co.uk/mediaselector/6/redir/version/2.0/"
+            f"mediaset/audio-nondrm-download/proto/https/vpid/{vpid}.mp3")
+
+
+def fetch_bbc_brand(brand_pid: str, fallback_feeds: List[str],
+                    notes: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Latest episode of a BBC brand (e.g. p002vsmz = WS 5-minute news bulletin)."""
+    notes = notes if notes is not None else []
+    episode_pid, title, dt = None, "BBC News Bulletin", None
+    # Strategy 1: BBC Sounds rms API
+    try:
+        data = http_get(
+            f"https://rms.api.bbc.co.uk/v2/programmes/playable"
+            f"?container={brand_pid}&sort=-release_date&type=episode"
+        ).json()
+        items = data.get("data") or []
+        if items:
+            ep = items[0]
+            episode_pid = ep.get("id")
+            t = ep.get("titles") or {}
+            title = " — ".join(x for x in (t.get("primary"), t.get("secondary")) if x) or title
+            dt = parse_dt_any((ep.get("release") or {}).get("date"))
+            notes.append(f"rms ok (episode {episode_pid})")
+    except Exception as exc:
+        notes.append(f"rms fail: {str(exc)[:80]}")
+    # Strategy 2: legacy programmes API
+    if not episode_pid:
+        try:
+            data = http_get(
+                f"https://www.bbc.co.uk/programmes/{brand_pid}/episodes/player.json"
+            ).json()
+            eps = data.get("episodes") or []
+            if eps:
+                prog = eps[0].get("programme") or eps[0]
+                episode_pid = prog.get("pid")
+                title = prog.get("display_title", {}).get("title") if isinstance(
+                    prog.get("display_title"), dict) else (prog.get("title") or title)
+                notes.append(f"player.json ok (episode {episode_pid})")
+        except Exception as exc:
+            notes.append(f"player.json fail: {str(exc)[:80]}")
+    if episode_pid:
+        try:
+            vpid = _bbc_vpid(episode_pid)
+            if vpid:
+                audio = _bbc_audio_for_vpid(vpid, notes)
+                if audio:
+                    return {"title": title, "published": dt, "audio_url": audio}
+            else:
+                notes.append("no vpid in playlist.json")
+        except Exception as exc:
+            notes.append(f"playlist fail: {str(exc)[:80]}")
+    # Strategy 3: podcast RSS fallback (Global News Podcast etc.)
+    try:
+        best = fetch_rss_latest(fallback_feeds)
+        if best:
+            notes.append("rss fallback ok")
+            return best
+    except Exception as exc:
+        notes.append(f"rss fallback fail: {str(exc)[:80]}")
+    return None
+
+
+# ---------- RAI (rainews.it notiziari page → relinker) ----------
+RELINKER_RE = re.compile(
+    r"https?://mediapolis[a-z0-9.]*\.rai\.it/relinker/relinkerServlet\.htm\?cont=\d+", re.I)
+
+
+def fetch_rainews(page_url: str, raiplaysound_json: str,
+                  notes: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Latest GR1 edition. rainews.it embeds player JSON with relinker media URLs;
+    fall back to the RaiPlaySound programme API."""
+    notes = notes if notes is not None else []
+    try:
+        page = html.unescape(http_get(page_url).text)
+        links = RELINKER_RE.findall(page)
+        if links:
+            notes.append(f"rainews page ok ({len(links)} relinker url(s))")
+            title = "GR1 — ultima edizione"
+            tm = re.search(r'"(?:title|titolo)"\s*:\s*"(GR1[^"]{0,100})"', page)
+            if tm:
+                title = tm.group(1)
+            dm = re.search(
+                r'"(?:date|publication_date|dataPubblicazione|createDate)"\s*:\s*"([^"]{6,40})"', page)
+            return {
+                "title": title,
+                "published": parse_dt_any(dm.group(1)) if dm else None,
+                "audio_url": links[0],
+            }
+        am = AUDIO_RE.search(page)
+        if am:
+            notes.append("rainews page ok (direct audio url)")
+            return {"title": "GR1 — ultima edizione", "published": None, "audio_url": am.group(0)}
+        notes.append("rainews page ok but no media url found")
+    except Exception as exc:
+        notes.append(f"rainews fail: {str(exc)[:80]}")
+    try:
+        res = fetch_raiplaysound(raiplaysound_json)
+        if res:
+            notes.append("raiplaysound fallback ok")
+            return res
+    except Exception as exc:
+        notes.append(f"raiplaysound fail: {str(exc)[:80]}")
     return None
 
 
@@ -356,21 +521,28 @@ SOURCES: Dict[str, Dict[str, Any]] = {
         "fresh_hours": 26,
     },
     "franceinfo": {
-        "station": "franceinfo — Journal",
+        "station": "Radio France — Journaux",
         "type": "rss",
-        # Per-hour journal feeds. 11736 (Journal de 19h) is verified live.
-        # Add more IDs here as you confirm them in the Diagnostics panel.
+        # Per-hour journal feeds across the day (incl. weekend editions).
+        # The app always plays the NEWEST episode across every feed listed here.
         "feeds": [
-            "https://radiofrance-podcast.net/podcast09/rss_11736.xml",
+            "https://radiofrance-podcast.net/podcast09/rss_11468.xml",  # Journal de 6h30
+            "https://radiofrance-podcast.net/podcast09/podcast_2115d44b-2fc6-4a09-bd5f-0f3d6841cc3c.xml",  # 7h30 week-end
+            "https://radiofrance-podcast.net/podcast09/rss_12495.xml",  # Journal de 08h00
+            "https://radiofrance-podcast.net/podcast09/podcast_c07ed278-d257-11e0-b8ee-842b2b72cd1d.xml",  # Journal de 18h
+            "https://radiofrance-podcast.net/podcast09/rss_11736.xml",  # Journal de 19h
+            "https://radiofrance-podcast.net/podcast09/podcast_2510ac6e-d25a-11e0-b8ee-842b2b72cd1d.xml",  # Journal de 23h
+            "https://radiofrance-podcast.net/podcast09/podcast_aa87513b-cba9-4a00-ad88-8cba8c77143d.xml",  # Journaux France Culture
         ],
         "live": "https://icecast.radiofrance.fr/franceinfo-midfi.mp3",
         "fresh_hours": 26,
     },
     "bbc_bulletin": {
-        "station": "BBC World Service — News",
-        "type": "rss",
-        "feeds": [
-            "https://podcasts.files.bbci.co.uk/p002vsmz.rss",   # 5-min bulletin brand (may be empty)
+        "station": "BBC World Service — News Bulletin",
+        "type": "bbc",
+        "brand": "p002vsmz",  # 5-minute news bulletin brand from bbc.com/audio
+        "fallback_feeds": [
+            "https://podcasts.files.bbci.co.uk/p002vsmz.rss",
             "https://podcasts.files.bbci.co.uk/p02nq0gn.rss",   # Global News Podcast (verified)
         ],
         "live_lookup": {"name": "BBC World Service"},
@@ -392,10 +564,11 @@ SOURCES: Dict[str, Dict[str, Any]] = {
     },
     "rai_gr1": {
         "station": "Rai Radio 1 — GR1",
-        "type": "raiplaysound",
+        "type": "rainews",
+        "page": "https://www.rainews.it/notiziari/gr1",
         "json_url": "https://www.raiplaysound.it/programmi/gr1.json",
         "live": "https://icestreaming.rai.it/1.mp3",
-        "fresh_hours": 5,
+        "fresh_hours": 8,
     },
     "bnr_horizont": {
         "station": "БНР Хоризонт — Новини",
@@ -436,21 +609,27 @@ def get_source_result(source_id: str) -> Dict[str, Any]:
     cfg = SOURCES[source_id]
     result: Dict[str, Any] = {
         "station": cfg["station"], "mode": None, "url": None,
-        "title": "", "published": None, "error": "",
+        "title": "", "published": None, "error": "", "debug": "",
     }
     bulletin = None
+    notes: List[str] = []
     if cfg["type"] != "live_only":
         try:
             if cfg["type"] == "rss":
                 bulletin = fetch_rss_latest(cfg["feeds"])
             elif cfg["type"] == "raiplaysound":
                 bulletin = fetch_raiplaysound(cfg["json_url"])
+            elif cfg["type"] == "rainews":
+                bulletin = fetch_rainews(cfg["page"], cfg["json_url"], notes)
+            elif cfg["type"] == "bbc":
+                bulletin = fetch_bbc_brand(cfg["brand"], cfg["fallback_feeds"], notes)
             elif cfg["type"] == "rtve":
                 bulletin = fetch_rtve(cfg["slug"])
             elif cfg["type"] == "bnr":
-                bulletin = fetch_bnr(cfg["pages"])
+                bulletin = fetch_bnr(cfg["pages"], notes)
         except Exception as exc:
             result["error"] = str(exc)[:300]
+    result["debug"] = " → ".join(notes)
 
     fresh = False
     if bulletin:
@@ -458,7 +637,11 @@ def get_source_result(source_id: str) -> Dict[str, Any]:
         if dt is None:
             fresh = True  # no timestamp — trust the feed ordering
         else:
-            fresh = (datetime.now(timezone.utc) - dt) <= timedelta(hours=cfg["fresh_hours"])
+            window = cfg["fresh_hours"]
+            if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+                # date-only precision (parsed as midnight) — judge by day, not hour
+                window = max(window, 26)
+            fresh = (datetime.now(timezone.utc) - dt) <= timedelta(hours=window)
 
     if bulletin and fresh:
         result.update(
@@ -721,6 +904,8 @@ with st.expander("🩺 Diagnostics — what each source returned"):
                 st.write(f"Stale bulletin available: “{sb['title']}” — {sb['published']}")
             if res["error"]:
                 st.code(res["error"], language=None)
+            if res.get("debug"):
+                st.caption(f"Trace: {res['debug']}")
             if res["url"]:
                 st.audio(res["url"])
             st.divider()
