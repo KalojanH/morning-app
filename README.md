@@ -6,16 +6,18 @@ One-tap multilingual morning news: press play, hear the latest news bulletin per
 
 It doesn't seek live streams at all. Instead, the Python backend fetches each broadcaster's **recorded bulletin** (podcast RSS / JSON APIs / embedded page data) server-side and hands the browser a direct audio file that naturally starts at 0:00 of the bulletin. Live streams are only used as a fallback when no fresh bulletin exists.
 
-| Language | Bulletin source | Method |
+All four problem sources were fixed by inspecting the real players in Chrome (network + embedded data):
+
+| Language | Bulletin source | Method (verified in browser) |
 |---|---|---|
 | 🇩🇪 | DLF Nachrichten | RSS (verified, same as your prototype) |
-| 🇫🇷 | Radio France "Le journal de …" | 6 per-hour journal feeds (6h30, 7h30 w-e, 8h, 18h, 19h, 23h), title-filtered to journals only — newest wins |
-| 🇬🇧 | BBC WS News Bulletin | Hourly short bulletins of brand p002vsmz only (Sounds `rms` API → `playlist.json` → mediaselector mp3) |
+| 🇫🇷 | franceinfo "Le journal de …" | franceinfo's 16 hourly journal podcast pages have **no RSS**; fetcher walks back from the current Paris hour, episode pages embed the mp3 |
+| 🇬🇧 | BBC WS News Bulletin (hourly) | Sounds `rms` API episode ids → mediaselector **v3** (`cvid/urn:bbc:pips:pid:…`) → HLS audio master, played via **hls.js** |
 | 🇪🇸 | RNE Boletines | RTVE open API — program id resolved at runtime |
-| 🇮🇹 | Rai GR1 | rainews.it/notiziari/gr1 — relinker URLs resolved + content-type **verified server-side** |
-| 🇧🇬 | БНР Хоризонт | `__NEXT_DATA__` + Next.js data route; media URLs content-type **verified** (images on the same CMS route are rejected) |
+| 🇮🇹 | Rai GR1 | Edition list (title + ISO date + relinker URL) parsed from the page's `data` attributes; relinker `cont=` tokens are non-numeric; plays directly in `<audio>` (tested: 304s edition) |
+| 🇧🇬 | БНР Хоризонт | Hidden JSON API `binar.bg/api/programs/news/horizont` → `NewsAudio` uuid → `binar.bg/api/media/{uuid}` (verified server-side) |
 
-Every source returns the **latest two** bulletins: the player shows a "one bulletin earlier" button, and Diagnostics lists both with test players.
+Every source returns the **latest two** bulletins: the player shows a "one bulletin earlier" button, and Diagnostics lists both with test players (BBC's HLS URLs can't preview in the Diagnostics widget — main player only).
 
 Live fallbacks are resolved via radio-browser.info when no static URL is configured (avoids dead stream URLs and http/https mixed-content blocks).
 
@@ -27,12 +29,13 @@ Live fallbacks are resolved via radio-browser.info when no static URL is configu
 
 ## First-run checklist (Diagnostics panel)
 
-Some sources were built against documented APIs I could not fully verify from here. Each Diagnostics entry now shows a **Trace** line: which strategy was tried, which one answered, and why others failed — paste that trace back to me if a source still misbehaves.
+Each Diagnostics entry shows a **Trace** line: which strategy was tried, which one answered, and why others failed — paste that trace back if a source misbehaves.
 
-- **DLF / 🇫🇷 Journaux** — should be ✅ (French now covers mornings and weekends).
-- **BBC** — tries the Sounds API for the latest 5-min bulletin episode of `p002vsmz`; falls back to Global News Podcast RSS. NPR News Now stays available as switchable hourly alternative.
-- **RAI** — scrapes the GR1 notiziari page for the newest edition's media URL. Note: RAI's relinker occasionally geo-restricts; if the bulletin won't *play* (but shows ✅), tell me — the trace will distinguish fetch vs playback problems.
-- **БНР** — parses the embedded page data and the Next.js data route; trace shows how many audio candidates were found.
+Notes:
+
+- **🇫🇷** now delivers the true franceinfo hourly journal (5h–23h slots incl. 18h30; no 14h/15h/20h/21h editions exist as podcasts).
+- **🇬🇧** bulletins are HLS — they play in the main player (hls.js) but not in the small Diagnostics preview widget.
+- **🇮🇹** relinker URLs may be IP-checked at resolution time; the app hands your browser the original relinker (exactly what rainews.it itself does), so playback happens with your IP.
 
 ## Customizing
 
