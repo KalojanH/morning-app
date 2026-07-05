@@ -16,6 +16,8 @@ All four problem sources were fixed by inspecting the real players in Chrome (ne
 | 🇪🇸 | RNE Boletines | RTVE open API — program id resolved at runtime |
 | 🇮🇹 | Rai GR1 | Edition list (title + ISO date + relinker URL) parsed from the page's `data` attributes; relinker `cont=` tokens are non-numeric; plays directly in `<audio>` (tested: 304s edition) |
 | 🇧🇬 | БНР Хоризонт | Hidden JSON API `binar.bg/api/programs/news/horizont` → `NewsAudio` uuid → `binar.bg/api/media/{uuid}` (verified server-side) |
+| 🇷🇺 | Euronews «Новости дня» | Programme page lists episodes (3 editions/day); episode pages embed a direct **mp4** — the audio player plays its audio track |
+| 🇧🇪 | VRT Radio 1 nieuws | Public GraphQL (`page → player → modes → streamId`) → anonymous player token → media aggregator → HLS (hls.js) |
 
 Every source returns the **latest two** bulletins: the player shows a "one bulletin earlier" button, and Diagnostics lists both with test players (BBC's HLS URLs can't preview in the Diagnostics widget — main player only).
 
@@ -39,7 +41,7 @@ Notes:
 
 ## Customizing
 
-- **Order / on-off / source per language**: sidebar (↑ ↓ arrows, checkboxes, dropdowns).
+- **Order**: drag the language cards in the sidebar into any order (requires the `streamlit-sortables` package from requirements.txt; falls back to ↑/↓ arrows if missing). On-off checkboxes and per-language source dropdowns sit below.
 - **Add a station**: add an entry to `SOURCES` (types: `rss`, `raiplaysound`, `rtve`, `bnr`, `live_only`) and reference it in `LANGUAGES[...]["sources"]`.
 - **Freshness window**: `fresh_hours` per source decides when a bulletin is "too old" → live fallback.
 - Bulletins are cached 4 minutes; "🔄 Refresh bulletins" forces a refetch.

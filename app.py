@@ -45,6 +45,14 @@ def http_get(url: str, **kw) -> requests.Response:
     return resp
 
 
+def http_post(url: str, json_body: Any = None, extra_headers: Optional[Dict[str, str]] = None) -> requests.Response:
+    h = dict(HEADERS)
+    h.update(extra_headers or {})
+    resp = requests.post(url, json=json_body, headers=h, timeout=TIMEOUT)
+    resp.raise_for_status()
+    return resp
+
+
 def parse_dt_any(value: Any) -> Optional[datetime]:
     """Parse RFC2822, ISO-8601 and a few European date formats into aware UTC."""
     if not value or not isinstance(value, str):
@@ -480,6 +488,118 @@ def fetch_rainews(page_url: str, raiplaysound_json: str,
     return []
 
 
+# ---------- Euronews Russian (Top News Stories Today — video mp4, audio track) ----------
+EURONEWS_EP_RE = re.compile(r"/video/(\d{4})/(\d{2})/(\d{2})/[a-z0-9-]+")
+EURONEWS_MP4_RE = re.compile(r'"contentUrl"\s*:\s*"(https:[^"]+\.mp4[^"]*)"')
+EURONEWS_EDITIONS = {  # slug hint → (label, approx CET hour)
+    "utrennij": ("утренний выпуск", 8),
+    "dnevnoj": ("дневной выпуск", 13),
+    "vechernij": ("вечерний выпуск", 20),
+}
+
+
+def fetch_euronews(program_url: str, notes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """ru.euronews.com programme page lists episodes newest-first; each episode
+    page embeds a direct mp4 (JSON-LD contentUrl). <audio> plays the mp4's
+    audio track, so no video embedding is needed."""
+    notes = notes if notes is not None else []
+    base = "https://" + program_url.split("//", 1)[-1].split("/", 1)[0]
+    page = http_get(program_url).text
+    eps = list(dict.fromkeys(m.group(0) for m in EURONEWS_EP_RE.finditer(page)))
+    if not eps:
+        notes.append("no episode links found")
+        return []
+    notes.append(f"programme page ok ({len(eps)} episode(s))")
+    results: List[Dict[str, Any]] = []
+    for path in eps[:3]:
+        if len(results) >= 2:
+            break
+        try:
+            ep_page = http_get(base + path).text
+            m = EURONEWS_MP4_RE.search(ep_page)
+            if not m:
+                notes.append(f"{path.rsplit('/',1)[-1][:30]}: no contentUrl")
+                continue
+            dm = EURONEWS_EP_RE.search(path)
+            label, hour = "выпуск новостей", 12
+            for hint, (lab, h) in EURONEWS_EDITIONS.items():
+                if hint in path:
+                    label, hour = lab, h
+                    break
+            published = None
+            if dm:
+                published = datetime(
+                    int(dm.group(1)), int(dm.group(2)), int(dm.group(3)), hour, 0,
+                    tzinfo=ZoneInfo("Europe/Paris"),
+                ).astimezone(timezone.utc)
+                if datetime.now(timezone.utc) - published > timedelta(hours=30):
+                    notes.append("stale episode, stopping")
+                    break
+            results.append({
+                "title": f"Новости дня — {label}",
+                "published": published,
+                "audio_url": m.group(1),
+            })
+        except Exception as exc:
+            notes.append(f"episode fail: {str(exc)[:60]}")
+    return results
+
+
+# ---------- VRT Radio 1 (Flemish) — GraphQL → token → HLS ----------
+VRT_GQL = "https://www.vrt.be/vrtnu-api/graphql/public/v1"
+VRT_GQL_HEADERS = {
+    "content-type": "application/json",
+    "x-vrt-client-name": "WEB",
+    "x-vrt-client-version": "1.5.17",
+    "x-vrt-zone": "default",
+    "accept": "application/graphql-response+json, application/json",
+}
+VRT_TOKENS = "https://media-services-public.vrt.be/vualto-video-aggregator-web/rest/external/v2/tokens"
+VRT_VIDEOS = "https://media-services-public.vrt.be/vualto-video-aggregator-web/rest/external/v2/videos/"
+
+
+def fetch_vrt(page_id: str, notes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """VRT MAX 'recentste nieuws' (verified flow): public GraphQL page query →
+    modes[0].streamId → anonymous player token → media aggregator → HLS."""
+    notes = notes if notes is not None else []
+    q = ("query($id: ID!){ page(id:$id){ ... on PlaybackPage { title "
+         "player { title modes { label streamId durationInSeconds } } } } }")
+    data = http_post(VRT_GQL, {"query": q, "variables": {"id": page_id}},
+                     VRT_GQL_HEADERS).json()
+    player = ((data.get("data") or {}).get("page") or {}).get("player") or {}
+    modes = player.get("modes") or []
+    stream_id = modes[0].get("streamId") if modes else None
+    title = player.get("title") or "Nieuws (VRT Radio 1)"
+    if not stream_id:
+        notes.append("graphql ok but no streamId")
+        return []
+    notes.append("graphql ok")
+    token = http_post(VRT_TOKENS, {}, {"content-type": "application/json"}).json().get("vrtPlayerToken", "")
+    if not token:
+        notes.append("no player token")
+        return []
+    from urllib.parse import quote
+    agg = http_get(f"{VRT_VIDEOS}{quote(stream_id, safe='')}"
+                   f"?vrtPlayerToken={quote(token, safe='')}&client=vrtvideo@PROD").json()
+    hls = next((t.get("url") for t in agg.get("targetUrls", []) if t.get("type") == "hls"), None)
+    if not hls:
+        notes.append(f"aggregator ok but no hls ({[t.get('type') for t in agg.get('targetUrls', [])]})")
+        return []
+    notes.append("aggregator ok (hls)")
+    # 'nieuws van 20u00 op Radio 1' → today (or yesterday if in the future) at 20:00 Brussels
+    published = None
+    tm = re.search(r"(\d{1,2})u(\d{2})", title)
+    if tm:
+        brussels = ZoneInfo("Europe/Brussels")
+        now_b = datetime.now(brussels)
+        cand = now_b.replace(hour=int(tm.group(1)), minute=int(tm.group(2)),
+                             second=0, microsecond=0)
+        if cand > now_b + timedelta(minutes=5):
+            cand -= timedelta(days=1)
+        published = cand.astimezone(timezone.utc)
+    return [{"title": title, "published": published, "audio_url": hls, "format": "hls"}]
+
+
 # ---------- franceinfo (per-hour "Le journal de …" pages, no RSS exists) ----------
 # Slots verified to exist on radiofrance.fr/franceinfo/podcasts (Chrome, July 2026)
 FRANCEINFO_SLOTS = ["5h00", "6h00", "7h00", "8h00", "9h00", "10h00", "11h00", "12h00",
@@ -643,6 +763,19 @@ SOURCES: Dict[str, Dict[str, Any]] = {
         "live_lookup": {"name": "Nova News"},
         "fresh_hours": 0,
     },
+    "euronews_ru": {
+        "station": "Euronews — Новости дня",
+        "type": "euronews",
+        "program": "https://ru.euronews.com/programs/top-news-stories-today",
+        "fresh_hours": 30,  # three editions per day
+    },
+    "vrt_radio1": {
+        "station": "VRT Radio 1 — Nieuws",
+        "type": "vrt",
+        "page_id": "/vrtmax/kanalen/radio-1/recentste-nieuws/",
+        "live_lookup": {"name": "VRT Radio 1"},
+        "fresh_hours": 26,
+    },
 }
 
 LANGUAGES: Dict[str, Dict[str, Any]] = {
@@ -652,6 +785,8 @@ LANGUAGES: Dict[str, Dict[str, Any]] = {
     "es": {"flag": "🇪🇸", "label": "Español", "sources": ["rtve_boletines"]},
     "it": {"flag": "🇮🇹", "label": "Italiano", "sources": ["rai_gr1"]},
     "bg": {"flag": "🇧🇬", "label": "Български", "sources": ["bnr_horizont", "nova_news"]},
+    "ru": {"flag": "🇷🇺", "label": "Русский", "sources": ["euronews_ru"]},
+    "nl": {"flag": "🇧🇪", "label": "Vlaams", "sources": ["vrt_radio1"]},
 }
 DEFAULT_ORDER = list(LANGUAGES.keys())
 
@@ -686,6 +821,10 @@ def get_source_result(source_id: str) -> Dict[str, Any]:
                 bulletins = fetch_bnr(cfg["api"], cfg["media_base"], notes)
             elif cfg["type"] == "franceinfo":
                 bulletins = fetch_franceinfo(cfg["base"], notes)
+            elif cfg["type"] == "euronews":
+                bulletins = fetch_euronews(cfg["program"], notes)
+            elif cfg["type"] == "vrt":
+                bulletins = fetch_vrt(cfg["page_id"], notes)
         except Exception as exc:
             result["error"] = str(exc)[:300]
     result["debug"] = " → ".join(notes)
@@ -732,12 +871,25 @@ def get_source_result(source_id: str) -> Dict[str, Any]:
 # =====================================================================
 # Sidebar — order, sources, refresh
 # =====================================================================
+try:
+    from streamlit_sortables import sort_items
+    HAS_SORTABLES = True
+except ImportError:
+    HAS_SORTABLES = False
+
 if "lang_order" not in st.session_state:
     st.session_state.lang_order = DEFAULT_ORDER.copy()
+for _code in LANGUAGES:  # pick up newly added languages
+    if _code not in st.session_state.lang_order:
+        st.session_state.lang_order.append(_code)
 if "enabled" not in st.session_state:
-    st.session_state.enabled = {k: True for k in LANGUAGES}
+    st.session_state.enabled = {}
+for _code in LANGUAGES:
+    st.session_state.enabled.setdefault(_code, True)
 if "chosen_source" not in st.session_state:
-    st.session_state.chosen_source = {k: v["sources"][0] for k, v in LANGUAGES.items()}
+    st.session_state.chosen_source = {}
+for _code, _v in LANGUAGES.items():
+    st.session_state.chosen_source.setdefault(_code, _v["sources"][0])
 
 
 def move_lang(code: str, delta: int) -> None:
@@ -748,24 +900,40 @@ def move_lang(code: str, delta: int) -> None:
         order[i], order[j] = order[j], order[i]
 
 
+LABEL_TO_CODE = {f"{v['flag']} {v['label']}": k for k, v in LANGUAGES.items()}
+
 with st.sidebar:
     st.header("⚙️ Languages")
-    st.caption("Order = play order. Toggle off what you skip today.")
+    if HAS_SORTABLES:
+        st.caption("Drag to set the play order. Toggle off what you skip today.")
+        labels = [f"{LANGUAGES[c]['flag']} {LANGUAGES[c]['label']}"
+                  for c in st.session_state.lang_order]
+        sorted_labels = sort_items(labels, direction="vertical", key="lang_sortable")
+        new_order = [LABEL_TO_CODE[lb] for lb in sorted_labels if lb in LABEL_TO_CODE]
+        if new_order and new_order != st.session_state.lang_order:
+            st.session_state.lang_order = new_order
+    else:
+        st.caption("Order = play order (↑/↓). Toggle off what you skip today.")
     for code in st.session_state.lang_order:
         lang = LANGUAGES[code]
-        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
-        with c1:
+        if HAS_SORTABLES:
             st.session_state.enabled[code] = st.checkbox(
                 f"{lang['flag']} {lang['label']}",
                 value=st.session_state.enabled[code],
                 key=f"en_{code}",
             )
-        with c2:
-            st.button("↑", key=f"up_{code}", on_click=move_lang, args=(code, -1))
-        with c3:
-            st.button("↓", key=f"dn_{code}", on_click=move_lang, args=(code, 1))
-        with c4:
-            st.write("")
+        else:
+            c1, c2, c3 = st.columns([3, 1, 1])
+            with c1:
+                st.session_state.enabled[code] = st.checkbox(
+                    f"{lang['flag']} {lang['label']}",
+                    value=st.session_state.enabled[code],
+                    key=f"en_{code}",
+                )
+            with c2:
+                st.button("↑", key=f"up_{code}", on_click=move_lang, args=(code, -1))
+            with c3:
+                st.button("↓", key=f"dn_{code}", on_click=move_lang, args=(code, 1))
         if len(lang["sources"]) > 1:
             st.session_state.chosen_source[code] = st.selectbox(
                 "Source",
