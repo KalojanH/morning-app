@@ -9,11 +9,13 @@ It doesn't seek live streams at all. Instead, the Python backend fetches each br
 | Language | Bulletin source | Method |
 |---|---|---|
 | 🇩🇪 | DLF Nachrichten | RSS (verified, same as your prototype) |
-| 🇫🇷 | Radio France Journaux | 7 per-hour journal feeds (6h30, 7h30 w-e, 8h, 18h, 19h, 23h, France Culture) — newest wins |
-| 🇬🇧 | BBC WS News Bulletin | Sounds `rms` API → `playlist.json` → mediaselector mp3; RSS + NPR News Now fallbacks |
+| 🇫🇷 | Radio France "Le journal de …" | 6 per-hour journal feeds (6h30, 7h30 w-e, 8h, 18h, 19h, 23h), title-filtered to journals only — newest wins |
+| 🇬🇧 | BBC WS News Bulletin | Hourly short bulletins of brand p002vsmz only (Sounds `rms` API → `playlist.json` → mediaselector mp3) |
 | 🇪🇸 | RNE Boletines | RTVE open API — program id resolved at runtime |
-| 🇮🇹 | Rai GR1 | rainews.it/notiziari/gr1 page (relinker media URL) + RaiPlaySound JSON fallback |
-| 🇧🇬 | БНР Хоризонт | `__NEXT_DATA__` + Next.js `/_next/data/` route on binar.bg / bnrnews.bg |
+| 🇮🇹 | Rai GR1 | rainews.it/notiziari/gr1 — relinker URLs resolved + content-type **verified server-side** |
+| 🇧🇬 | БНР Хоризонт | `__NEXT_DATA__` + Next.js data route; media URLs content-type **verified** (images on the same CMS route are rejected) |
+
+Every source returns the **latest two** bulletins: the player shows a "one bulletin earlier" button, and Diagnostics lists both with test players.
 
 Live fallbacks are resolved via radio-browser.info when no static URL is configured (avoids dead stream URLs and http/https mixed-content blocks).
 
