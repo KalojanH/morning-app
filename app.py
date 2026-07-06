@@ -778,6 +778,91 @@ SOURCES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# =====================================================================
+# Live-rewind track (parallel to bulletins).
+# Browser inspection (July 2026): only BBC WS and RTVE 24h expose live
+# streams with a DVR window big enough to rewind to the last full hour.
+# All other stations get their :00 recorded bulletin in rewind mode.
+# =====================================================================
+LIVE_REWIND: Dict[str, Dict[str, Any]] = {
+    "en": {
+        "type": "dvr",
+        "station": "BBC World Service — live",
+        "resolver": "bbc_ws",   # mediaselector lookup first (pool number can change)
+        "urls": [
+            "https://as-hls-ww-live.akamaized.net/pool_07364996/live/ww/"
+            "bbc_world_service_news_internet/bbc_world_service_news_internet.isml/"
+            "bbc_world_service_news_internet-audio%3d96000.m3u8",
+        ],
+    },
+    "es": {
+        "type": "dvr",
+        "station": "RTVE Canal 24 horas — en directo",
+        "urls": [
+            "https://rtvelivestream.rtve.es/rtvesec/24h/24h_main_dvr_576.m3u8",
+            "https://rtvelivestream.rtve.es/rtvesec/24h/24h_main_dvr_720.m3u8",
+        ],
+    },
+    # de / fr / it / bg / ru / nl → type "bulletin" (their live streams keep
+    # no DVR buffer — verified: DLF icecast, franceinfo 30s, RaiNews24 1min
+    # tokenized, BNR 30s). The :00 bulletin IS what aired at the full hour.
+}
+
+
+def _hls_window_minutes(manifest: str) -> int:
+    durs = re.findall(r"#EXTINF:([\d.]+)", manifest)
+    return int(sum(float(d) for d in durs) / 60)
+
+
+def _resolve_bbc_ws_live() -> List[str]:
+    """mediaselector v2 for the live WS stream; strip .norewind to get the
+    DVR-windowed HLS variant."""
+    out: List[str] = []
+    try:
+        ms = http_get(
+            "https://open.live.bbc.co.uk/mediaselector/6/select/version/2.0/"
+            "mediaset/pc/vpid/bbc_world_service/format/json"
+        ).json()
+        for media in ms.get("media", []) or []:
+            for conn in media.get("connection", []) or []:
+                href = conn.get("href", "")
+                if href.startswith("https") and ".m3u8" in href:
+                    out.append(href.replace(".norewind", ""))
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_rewind_stream(lang: str) -> Optional[Dict[str, Any]]:
+    """Return a verified DVR live stream for a language, or None."""
+    cfg = LIVE_REWIND.get(lang)
+    if not cfg or cfg.get("type") != "dvr":
+        return None
+    candidates: List[str] = []
+    if cfg.get("resolver") == "bbc_ws":
+        candidates.extend(_resolve_bbc_ws_live())
+    candidates.extend(cfg["urls"])
+    unverified: Optional[str] = None
+    for url in candidates:
+        try:
+            manifest = http_get(url).text
+            if "#EXTM3U" not in manifest:
+                continue
+            window = _hls_window_minutes(manifest)
+            if window >= 65:
+                return {"url": url, "window_min": window, "station": cfg["station"],
+                        "verified": True}
+            if window == 0 and "#EXT-X-STREAM-INF" in manifest:
+                unverified = unverified or url  # master playlist — window unknown
+        except Exception:
+            continue
+    if unverified:
+        return {"url": unverified, "window_min": 0, "station": cfg["station"],
+                "verified": False}
+    return None
+
+
 LANGUAGES: Dict[str, Dict[str, Any]] = {
     "de": {"flag": "🇩🇪", "label": "Deutsch", "sources": ["dlf", "dlf_kultur"]},
     "fr": {"flag": "🇫🇷", "label": "Français", "sources": ["franceinfo"]},
@@ -959,12 +1044,48 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+play_mode = st.radio(
+    "Mode",
+    ["📰 Hourly bulletins", "⏪ Live, rewound to :00"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="play_mode",
+)
+IS_REWIND = play_mode.startswith("⏪")
+if IS_REWIND:
+    st.caption(
+        "True live rewind where the broadcaster keeps a buffer (BBC, RTVE); "
+        "everywhere else you hear that station's recorded :00 bulletin — "
+        "the same thing its live stream aired at the full hour."
+    )
+
 playlist: List[Dict[str, Any]] = []
 problems: List[str] = []
 active_codes = [c for c in st.session_state.lang_order if st.session_state.enabled[c]]
 
 with st.spinner("Fetching the latest bulletins…"):
     for code in active_codes:
+        base_item = {
+            "lang": code,
+            "flag": LANGUAGES[code]["flag"],
+            "label": LANGUAGES[code]["label"],
+        }
+        if IS_REWIND:
+            rw = get_rewind_stream(code)
+            if rw:
+                playlist.append({
+                    **base_item,
+                    "station": rw["station"],
+                    "mode": "rewind",
+                    "url": rw["url"],
+                    "title": "Live stream, rewound to the last full hour",
+                    "published": (f"DVR window ≈ {rw['window_min']} min"
+                                  if rw.get("verified") else "DVR window unverified"),
+                    "format": "hls",
+                    "alt": None,
+                })
+                continue
+            # no DVR stream for this language → recorded :00 bulletin below
         source_id = st.session_state.chosen_source[code]
         res = get_source_result(source_id)
         if res["url"]:
@@ -972,10 +1093,8 @@ with st.spinner("Fetching the latest bulletins…"):
             if res["mode"] == "bulletin" and len(res.get("bulletins", [])) > 1:
                 alt = res["bulletins"][1]
             playlist.append({
-                "lang": code,
-                "flag": LANGUAGES[code]["flag"],
-                "label": LANGUAGES[code]["label"],
-                "station": res["station"],
+                **base_item,
+                "station": res["station"] + (" · :00 bulletin" if IS_REWIND and res["mode"] == "bulletin" else ""),
                 "mode": res["mode"],
                 "url": res["url"],
                 "title": res["title"],
@@ -1055,17 +1174,55 @@ const PLAYLIST = __PLAYLIST__;
 let idx = 0, started = false, onAlt = false, hls = null;
 const audio = new Audio();
 audio.preload = "none";
+// Hidden sink for live-rewind HLS (RTVE's stream carries video, a bare Audio
+// element can't take it). Bulletins keep using the proven `audio` element.
+const liveEl = document.createElement("video");
+liveEl.style.display = "none";
+liveEl.playsInline = true;
+liveEl.preload = "none";
+document.body.appendChild(liveEl);
+let media = audio;
 const $ = id => document.getElementById(id);
+
+function switchMedia(el) {
+  if (media !== el) { try { media.pause(); } catch(e){} media = el; }
+}
+
+function seekToLastFullHour() {
+  const now = new Date();
+  const past = now.getMinutes() * 60 + now.getSeconds();  // seconds since :00
+  let tries = 0;
+  const attempt = () => {
+    tries++;
+    try {
+      const sk = media.seekable;
+      if (sk.length && sk.end(sk.length - 1) > 0) {
+        const start = sk.start(0), end = sk.end(sk.length - 1);
+        media.currentTime = Math.max(start + 4, end - past);
+        $("when").textContent = "⏪ rewound to " +
+          String(now.getHours()).padStart(2, "0") + ":00 — " +
+          Math.round(past / 60) + " min behind live";
+        return;
+      }
+    } catch(e) {}
+    if (tries < 24) setTimeout(attempt, 500);
+  };
+  attempt();
+}
 
 function setSource(item) {
   if (hls) { hls.destroy(); hls = null; }
+  const isRewind = item.mode === "rewind";
+  switchMedia(isRewind ? liveEl : audio);
   const isHls = item.format === "hls" || /\.m3u8/.test(item.url);
   if (isHls && window.Hls && Hls.isSupported()) {
-    hls = new Hls();
+    hls = new Hls(isRewind ? {liveDurationInfinity: true} : {});
     hls.loadSource(item.url);
-    hls.attachMedia(audio);
+    hls.attachMedia(media);
+    if (isRewind) hls.once(Hls.Events.LEVEL_LOADED, () => seekToLastFullHour());
   } else {
-    audio.src = item.url;  // Safari plays HLS natively; files play everywhere
+    media.src = item.url;  // Safari plays HLS natively; files play everywhere
+    if (isRewind) media.addEventListener("loadedmetadata", () => seekToLastFullHour(), {once: true});
   }
 }
 
@@ -1074,7 +1231,9 @@ function renderChips() {
   PLAYLIST.forEach((item, i) => {
     const c = document.createElement("div");
     c.className = "chip" + (i === idx ? " active" : "");
-    c.innerHTML = item.flag + " " + item.label + (item.mode === "live" ? ' <span class="lv">LIVE</span>' : "");
+    c.innerHTML = item.flag + " " + item.label
+      + (item.mode === "live" ? ' <span class="lv">LIVE</span>' : "")
+      + (item.mode === "rewind" ? ' <span class="lv" style="background:#0ea5e9">⏪</span>' : "");
     c.onclick = () => playIndex(i);
     $("chips").appendChild(c);
   });
@@ -1090,6 +1249,7 @@ function renderNow() {
   $("station").textContent = item.station;
   $("title").textContent = started ? item.title : "Press play to start your briefing";
   $("when").textContent = item.mode === "live" ? "● live stream"
+      : item.mode === "rewind" ? "⏪ live rewind — " + (item.published || "")
       : ((item.published || "latest bulletin") + (onAlt ? "  · older bulletin" : ""));
   $("foot").textContent = (idx + 1) + " / " + PLAYLIST.length + " — auto-advances when a bulletin ends";
   const base = PLAYLIST[idx];
@@ -1114,36 +1274,48 @@ function playIndex(i, keepAlt) {
   started = true;
   const item = current();
   setSource(item);
-  audio.play().catch(() => {});
+  media.play().catch(() => {});
   renderNow();
   $("play").textContent = "⏸";
 }
 $("play").onclick = () => {
   if (!started) { playIndex(0); return; }
-  if (audio.paused) { audio.play().catch(()=>{}); $("play").textContent = "⏸"; }
-  else { audio.pause(); $("play").textContent = "▶"; }
+  if (media.paused) { media.play().catch(()=>{}); $("play").textContent = "⏸"; }
+  else { media.pause(); $("play").textContent = "▶"; }
 };
 $("next").onclick = () => playIndex(idx + 1);
 $("prev").onclick = () => playIndex(idx - 1);
-$("back").onclick = () => { if (isFinite(audio.duration)) audio.currentTime = Math.max(0, audio.currentTime - 15); };
-$("fwd").onclick  = () => { if (isFinite(audio.duration)) audio.currentTime = Math.min(audio.duration, audio.currentTime + 15); };
-audio.onended = () => {
+function nudge(delta) {
+  try {
+    const sk = media.seekable;
+    if (!sk.length) return;
+    media.currentTime = Math.max(sk.start(0),
+      Math.min(sk.end(sk.length - 1) - 1, media.currentTime + delta));
+  } catch(e) {}
+}
+$("back").onclick = () => nudge(-15);
+$("fwd").onclick  = () => nudge(15);
+function onEnded() {
+  if (media !== audio) return;  // live streams don't end
   if (idx + 1 < PLAYLIST.length) playIndex(idx + 1);
   else { $("play").textContent = "▶"; $("title").textContent = "Briefing finished ✓"; }
-};
-audio.ontimeupdate = () => {
-  if (isFinite(audio.duration) && audio.duration > 0)
-    $("fill").style.width = (100 * audio.currentTime / audio.duration) + "%";
+}
+function onTime() {
+  if (isFinite(media.duration) && media.duration > 0)
+    $("fill").style.width = (100 * media.currentTime / media.duration) + "%";
   else $("fill").style.width = "100%";
-};
-$("bar").onclick = (e) => {
-  if (!isFinite(audio.duration)) return;
-  const r = $("bar").getBoundingClientRect();
-  audio.currentTime = audio.duration * (e.clientX - r.left) / r.width;
-};
-audio.onerror = () => {
+}
+function onErr() {
   $("title").textContent = "⚠ Could not play — skipping in 2s";
   if (started) setTimeout(() => { if (idx + 1 < PLAYLIST.length) playIndex(idx + 1); }, 2000);
+}
+for (const el of [audio, liveEl]) {
+  el.onended = onEnded; el.ontimeupdate = onTime; el.onerror = onErr;
+}
+$("bar").onclick = (e) => {
+  if (!isFinite(media.duration)) return;
+  const r = $("bar").getBoundingClientRect();
+  media.currentTime = media.duration * (e.clientX - r.left) / r.width;
 };
 if ("mediaSession" in navigator) {
   navigator.mediaSession.setActionHandler("nexttrack", () => playIndex(idx + 1));
@@ -1185,3 +1357,15 @@ with st.expander("🩺 Diagnostics — what each source returned"):
             if res.get("debug"):
                 st.caption(f"Trace: {res['debug']}")
             st.divider()
+    st.markdown("**⏪ Live-rewind streams (DVR)**")
+    for code, cfg in LIVE_REWIND.items():
+        rw = get_rewind_stream(code)
+        if rw:
+            icon = "✅" if rw.get("verified") else "⚠️"
+            st.write(f"{icon} {LANGUAGES[code]['flag']} {rw['station']} — "
+                     f"DVR window ≈ {rw['window_min']} min")
+            st.code(rw["url"], language=None)
+        else:
+            st.write(f"❌ {LANGUAGES[code]['flag']} {cfg['station']} — no DVR stream reachable")
+    st.caption("All other stations keep no live buffer (verified July 2026) — "
+               "rewind mode plays their recorded :00 bulletin instead.")

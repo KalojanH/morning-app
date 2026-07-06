@@ -23,6 +23,23 @@ Every source returns the **latest two** bulletins: the player shows a "one bulle
 
 Live fallbacks are resolved via radio-browser.info when no static URL is configured (avoids dead stream URLs and http/https mixed-content blocks).
 
+## ⏪ Live-rewind mode (parallel track)
+
+A toggle above the player switches between **Hourly bulletins** and **Live, rewound to :00**. In rewind mode, at e.g. 07:11 you hear the live stream from 07:00 (11 minutes behind live), with full scrubbing via ±15s and next/prev as usual.
+
+Physics check (browser-verified, July 2026): rewinding requires the broadcaster to keep a DVR buffer.
+
+| Station | Live buffer | Rewind mode behaviour |
+|---|---|---|
+| 🇬🇧 BBC WS | ~6 h HLS DVR (public) | ✅ true rewind — URL auto-resolved via mediaselector (`.norewind` stripped) |
+| 🇪🇸 RTVE 24h | ~111 min HLS DVR (public `_dvr_` variant) | ✅ true rewind (video stream; audio plays via hidden sink) |
+| 🇩🇪 DLF | Icecast only | :00 Nachrichten bulletin |
+| 🇫🇷 franceinfo | ~30 s window | :00 journal bulletin |
+| 🇮🇹 RaiNews24 | ~1 min, tokenized | :00 GR1 edition |
+| 🇧🇬 BNR | ~30 s window | :00 емисия |
+
+Seek math: `position = liveEdge − (minutes past the hour)` — no timestamps needed, works on any DVR stream. Diagnostics shows each DVR stream's measured window.
+
 ## Deploy (same as your prototype)
 
 1. Replace `app.py` and `requirements.txt` in your GitHub repo.
